@@ -2908,6 +2908,296 @@ function Read-YesNo {
     }
 }
 
+# ============================================================================
+# Intelligent Signature & Fingerprint Verification Engine (Selected v2 Features)
+# ============================================================================
+
+$SmartCacheFile = Join-Path $Mv2DataDir 'cache.json'
+
+function Get-PEFingerprint {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+
+    $fp = [ordered]@{
+        Path          = $Path
+        FileLength    = (Get-Item -LiteralPath $Path).Length
+        FileVersion   = ''
+        ProductVersion= ''
+        Architecture  = ''
+        Machine       = 0
+        TimeDateStamp = 0
+        TimeDateString= ''
+        SizeOfImage   = 0
+        CheckSum      = 0
+        Authenticode  = 'Unknown'
+        SHA256        = ''
+    }
+
+    try {
+        $vi = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+        if ($vi.FileVersion) { $fp.FileVersion = $vi.FileVersion.Trim() }
+        if ($vi.ProductVersion) { $fp.ProductVersion = $vi.ProductVersion.Trim() }
+    } catch { }
+
+    try {
+        $hdr = [byte[]]::new(4096)
+        $fs = [IO.File]::OpenRead($Path)
+        try { $n = $fs.Read($hdr, 0, $hdr.Length) } finally { $fs.Dispose() }
+        if ($n -ge 64 -and $hdr[0] -eq 0x4D -and $hdr[1] -eq 0x5A) {
+            $eLfanew = [BitConverter]::ToUInt32($hdr, 0x3C)
+            if ($eLfanew + 24 -le $n -and $hdr[$eLfanew] -eq 0x50 -and $hdr[$eLfanew + 1] -eq 0x45) {
+                $machine = [BitConverter]::ToUInt16($hdr, [int]$eLfanew + 4)
+                $timeDateStamp = [BitConverter]::ToUInt32($hdr, [int]$eLfanew + 8)
+                $fp.Machine = $machine
+                $fp.TimeDateStamp = $timeDateStamp
+                try {
+                    $dt = (Get-Date '1970-01-01 00:00:00Z').AddSeconds($timeDateStamp).ToLocalTime()
+                    $fp.TimeDateString = $dt.ToString('yyyy-MM-dd HH:mm:ss')
+                } catch { }
+
+                $optOff = [int]$eLfanew + 24
+                $magic = [BitConverter]::ToUInt16($hdr, $optOff)
+                $fp.Architecture = switch ($machine) {
+                    0x8664  { 'x64' }
+                    0x014C  { 'x86' }
+                    0xAA64  { 'arm64' }
+                    default { '' }
+                }
+
+                $fixedLen = if ($magic -eq 0x20B) { 112 } elseif ($magic -eq 0x10B) { 96 } else { 0 }
+                if ($fixedLen -gt 0) {
+                    $fp.SizeOfImage = [BitConverter]::ToUInt32($hdr, $optOff + 56)
+                    $fp.CheckSum = [BitConverter]::ToUInt32($hdr, $optOff + 64)
+                    $secDirAt = $optOff + $fixedLen + 4 * 8
+                    if ($secDirAt + 8 -le $n) {
+                        $va = [BitConverter]::ToUInt32($hdr, $secDirAt)
+                        $sz = [BitConverter]::ToUInt32($hdr, $secDirAt + 4)
+                        $fp.Authenticode = if ($va -ne 0 -and $sz -ne 0) { 'Signed (Authenticode)' } else { 'Modified/Stripped' }
+                    }
+                }
+            }
+        }
+    } catch { }
+
+    try {
+        $fp.SHA256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+    } catch { }
+
+    return [pscustomobject]$fp
+}
+
+function Get-SmartCache {
+    param([string]$ImagePath, $Fingerprint)
+    if (-not (Test-Path -LiteralPath $SmartCacheFile -PathType Leaf)) {
+        return [pscustomobject]@{ Status = 'MISS'; Entry = $null }
+    }
+    try {
+        $raw = Get-Content -LiteralPath $SmartCacheFile -Raw
+        $cacheDoc = $raw | ConvertFrom-Json
+        if (-not $cacheDoc -or -not $cacheDoc.PSObject.Properties['Entries']) {
+            return [pscustomobject]@{ Status = 'MISS'; Entry = $null }
+        }
+        $key = [IO.Path]::GetFullPath($ImagePath).ToLowerInvariant()
+        $entryProp = $cacheDoc.Entries.PSObject.Properties[$key]
+        if (-not $entryProp -or -not $entryProp.Value) {
+            return [pscustomobject]@{ Status = 'MISS'; Entry = $null }
+        }
+        $entry = $entryProp.Value
+
+        if ($Fingerprint) {
+            $isMatch = ($entry.FileLength -eq $Fingerprint.FileLength) -and
+                       ($entry.TimeDateStamp -eq $Fingerprint.TimeDateStamp) -and
+                       ($entry.Architecture -eq $Fingerprint.Architecture)
+            if ($Fingerprint.SHA256 -and $entry.SHA256) {
+                if ($entry.SHA256 -ne $Fingerprint.SHA256) { $isMatch = $false }
+            }
+            if (-not $isMatch) {
+                return [pscustomobject]@{ Status = 'STALE'; Entry = $entry }
+            }
+        }
+        return [pscustomobject]@{ Status = 'HIT'; Entry = $entry }
+    } catch {
+        return [pscustomobject]@{ Status = 'CORRUPT'; Entry = $null }
+    }
+}
+
+function Set-SmartCache {
+    param([string]$ImagePath, $Fingerprint, $Analysis)
+    try {
+        if (-not (Test-Path -LiteralPath $Mv2DataDir -PathType Container)) {
+            New-Item -ItemType Directory -Path $Mv2DataDir -Force | Out-Null
+        }
+        $cacheDoc = $null
+        if (Test-Path -LiteralPath $SmartCacheFile -PathType Leaf) {
+            try { $cacheDoc = Get-Content -LiteralPath $SmartCacheFile -Raw | ConvertFrom-Json } catch { }
+        }
+        if (-not $cacheDoc -or -not $cacheDoc.PSObject.Properties['Entries']) {
+            $cacheDoc = [pscustomobject]@{
+                Version = 1
+                Entries = [pscustomobject]@{}
+            }
+        }
+        $key = [IO.Path]::GetFullPath($ImagePath).ToLowerInvariant()
+        $entry = [ordered]@{
+            ImagePath       = $ImagePath
+            FileLength      = $Fingerprint.FileLength
+            TimeDateStamp   = $Fingerprint.TimeDateStamp
+            TimeDateString  = $Fingerprint.TimeDateString
+            Architecture    = $Fingerprint.Architecture
+            FileVersion     = $Fingerprint.FileVersion
+            SHA256          = $Fingerprint.SHA256
+            Milestone       = $Analysis.Milestone
+            Status          = $Analysis.Status
+            TotalGates      = $Analysis.Total
+            LocatedGates    = $Analysis.Located
+            VerifiedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        }
+        $cacheDoc.Entries | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]$entry) -Force
+        $json = $cacheDoc | ConvertTo-Json -Depth 5
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+        Write-AtomicFile -TargetPath $SmartCacheFile -Buf $bytes
+    } catch {
+        Write-Warn "Could not write smart cache: $_"
+    }
+}
+
+function Clear-SmartCache {
+    if (Test-Path -LiteralPath $SmartCacheFile -PathType Leaf) {
+        try { Remove-Item -LiteralPath $SmartCacheFile -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Test-ChromeMV2Compatibility {
+    param($Target, [bool]$ForceRescan = $false)
+
+    $targetDll = $Target.Path
+    if (-not (Test-Path -LiteralPath $targetDll -PathType Leaf)) {
+        return [pscustomobject]@{
+            Compatible   = $false
+            Status       = 'FILE_NOT_FOUND'
+            Reason       = "Target DLL not found at: $targetDll"
+            Fingerprint  = $null
+            Analysis     = $null
+            CacheStatus  = 'NONE'
+        }
+    }
+
+    $fp = Get-PEFingerprint -Path $targetDll
+    if (-not $fp.Architecture) {
+        return [pscustomobject]@{
+            Compatible   = $false
+            Status       = 'INVALID_PE'
+            Reason       = "Target is not a supported Windows PE binary."
+            Fingerprint  = $fp
+            Analysis     = $null
+            CacheStatus  = 'NONE'
+        }
+    }
+
+    $cacheResult = Get-SmartCache -ImagePath $targetDll -Fingerprint $fp
+    if (-not $ForceRescan -and $cacheResult.Status -eq 'HIT' -and $cacheResult.Entry) {
+        $entry = $cacheResult.Entry
+        $isFull = ($entry.Status -eq 'COMPATIBLE') -and ($entry.LocatedGates -eq $entry.TotalGates)
+        return [pscustomobject]@{
+            Compatible   = $isFull
+            Status       = $entry.Status
+            Reason       = $(if ($isFull) { "Verified via Smart Cache ($($entry.Milestone) - $($entry.LocatedGates)/$($entry.TotalGates) gates)" } else { "Incompatible according to cached analysis" })
+            Fingerprint  = $fp
+            Analysis     = [pscustomobject]@{
+                Milestone = $entry.Milestone
+                Located   = $entry.LocatedGates
+                Total     = $entry.TotalGates
+                Full      = $isFull
+                Relocated = $false
+            }
+            CacheStatus  = 'HIT'
+        }
+    }
+
+    # Perform thorough pre-flight analysis
+    $buf = [IO.File]::ReadAllBytes($targetDll)
+    if ($buf.Length -eq 0) {
+        return [pscustomobject]@{
+            Compatible   = $false
+            Status       = 'EMPTY_FILE'
+            Reason       = "Target file is 0 bytes."
+            Fingerprint  = $fp
+            Analysis     = $null
+            CacheStatus  = $cacheResult.Status
+        }
+    }
+
+    try {
+        $img = Open-Image $buf
+        $milestones = Import-Milestones
+        $targetContainer = switch ($fp.Architecture) {
+            'x64'   { 'pe' }
+            'x86'   { 'pe32' }
+            'arm64' { 'pe-arm64' }
+            default { '' }
+        }
+        $peMilestones = @()
+        foreach ($m in $milestones) {
+            if ($m.Container -eq $targetContainer) {
+                $peMilestones += $m
+            }
+        }
+
+        if ($peMilestones.Count -eq 0) {
+            return [pscustomobject]@{
+                Compatible   = $false
+                Status       = 'NO_TABLES_FOR_ARCH'
+                Reason       = "No signature milestone tables found for architecture '$($fp.Architecture)'."
+                Fingerprint  = $fp
+                Analysis     = $null
+                CacheStatus  = $cacheResult.Status
+            }
+        }
+
+        # Analyze gates without applying any modification
+        $analysis = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $peMilestones -Apply $false -Version $fp.FileVersion
+        
+        $isCompatible = ($analysis.Status -gt 0) -and ($analysis.Full -eq $true)
+        $statusStr = if ($isCompatible) { 'COMPATIBLE' } elseif ($analysis.Status -gt 0) { 'PARTIAL_MATCH' } else { 'UNSUPPORTED' }
+        $reasonStr = if ($isCompatible) {
+            "Verified 100% full match with milestone '$($analysis.Milestone)' ($($analysis.Located)/$($analysis.Total) gates matched)."
+        } elseif ($analysis.Status -gt 0) {
+            "Only partial match with milestone '$($analysis.Milestone)' ($($analysis.Located)/$($analysis.Total) gates matched). Fail-closed safety prevents patching."
+        } else {
+            "No known milestone signature table matches this Chrome binary."
+        }
+
+        $resultAnalysis = [pscustomobject]@{
+            Milestone = $analysis.Milestone
+            Located   = $analysis.Located
+            Total     = $analysis.Total
+            Full      = $analysis.Full
+            Relocated = $analysis.Relocated
+            Status    = $statusStr
+        }
+
+        Set-SmartCache -ImagePath $targetDll -Fingerprint $fp -Analysis $resultAnalysis
+
+        return [pscustomobject]@{
+            Compatible   = $isCompatible
+            Status       = $statusStr
+            Reason       = $reasonStr
+            Fingerprint  = $fp
+            Analysis     = $resultAnalysis
+            CacheStatus  = $cacheResult.Status
+        }
+    } catch {
+        return [pscustomobject]@{
+            Compatible   = $false
+            Status       = 'ANALYSIS_ERROR'
+            Reason       = "Analysis error: $($_.Exception.Message)"
+            Fingerprint  = $fp
+            Analysis     = $null
+            CacheStatus  = $cacheResult.Status
+        }
+    }
+}
+
 # install: undo any old on-disk patch -> download version.dll (+ signatures) ->
 # place next to chrome.exe -> clear policies -> optional uBO. Returns 0 on
 # success, 1 if nothing was installed.
@@ -2919,6 +3209,21 @@ function Invoke-Install {
         Write-Err "Couldn't find chrome.exe next to this Chrome - nowhere to install version.dll."
         return 1
     }
+
+    # Pre-flight Intelligent Signature & Fingerprint verification (Fail-Closed Safety)
+    Write-Info 'Running pre-flight Intelligent Signature & Fingerprint verification...'
+    $compat = Test-ChromeMV2Compatibility -Target $Target
+    if (-not $compat.Compatible) {
+        Write-Err 'Pre-flight compatibility verification failed!'
+        Write-Host "    Target: $($Target.Path)"
+        Write-Host "    Reason: $($compat.Reason)"
+        if ($compat.Analysis -and $compat.Analysis.Milestone) {
+            Write-Host "    Gates satisfied: $($compat.Analysis.Located)/$($compat.Analysis.Total)"
+        }
+        Write-Host '    Fail-Closed Safety: Aborting install to prevent leaving Chrome in an unstable state.'
+        return 1
+    }
+    Write-Ok "Compatibility verified: $($compat.Reason)"
 
     # (1) A stock chrome.dll is required for DRM, so undo an old byte-patch first.
     $backupPath = Get-BackupPath $Target.Path
@@ -3134,42 +3439,102 @@ function Invoke-Restore {
 function Invoke-Check {
     param($Target)
 
+    Initialize-Colors
     $appDir = Get-AppDir $Target
     $installed = $false
+
+    Write-Host ''
+    Write-Host "$($C.Bold)==========================================================$($C.Reset)"
+    Write-Host "$($C.Bold)                 MV2 Diagnostics Report                   $($C.Reset)"
+    Write-Host "$($C.Bold)==========================================================$($C.Reset)"
+
+    $selName = Get-BrowserDisplayName $Target.Channel
+    Write-Host ("  {0,-24} : {1}" -f "Target Browser", $selName)
+    Write-Host ("  {0,-24} : {1}" -f "Target Path", $Target.Path)
+
+    # Pre-flight Fingerprint & Compatibility analysis
+    $compat = Test-ChromeMV2Compatibility -Target $Target
+    $fp = $compat.Fingerprint
+
+    if ($fp) {
+        $verDisp = if ($fp.FileVersion) { "$($fp.FileVersion) ($($fp.Architecture))" } else { "Unknown ($($fp.Architecture))" }
+        Write-Host ("  {0,-24} : {1}" -f "Chrome Version", $verDisp)
+        Write-Host ("  {0,-24} : Timestamp: {1} | Size: {2:N0} bytes" -f "PE Fingerprint", $fp.TimeDateString, $fp.FileLength)
+        Write-Host ("  {0,-24} : {1}" -f "Authenticode Status", $fp.Authenticode)
+        if ($fp.SHA256) {
+            $shaShort = if ($fp.SHA256.Length -ge 16) { $fp.SHA256.Substring(0, 16) + '...' } else { $fp.SHA256 }
+            Write-Host ("  {0,-24} : {1}" -f "SHA-256 (prefix)", $shaShort)
+        }
+    }
+
+    Write-Host ("  {0,-24} : {1}" -f "Smart Cache Status", $compat.CacheStatus)
+
+    if ($compat.Analysis -and $compat.Analysis.Milestone) {
+        $an = $compat.Analysis
+        $gateColor = if ($compat.Compatible) { $C.Grn } else { $C.Yel }
+        Write-Host ("  {0,-24} : {1}{2} ({3}/{4} gates verified){5}" -f "Milestone Compatibility", $gateColor, $an.Milestone, $an.Located, $an.Total, $C.Reset)
+    } else {
+        Write-Host ("  {0,-24} : {1}{2}{3}" -f "Milestone Compatibility", $C.Red, "No matching milestone table", $C.Reset)
+    }
+
+    # version.dll status
     if ($appDir) {
         $dll = Join-Path $appDir 'version.dll'
         if (Test-Path -LiteralPath $dll -PathType Leaf) {
             $installed = $true
             $a = Get-PeArch $dll
-            Write-Ok ("version.dll is installed ({0})." -f $(if ($a) { $a } else { 'unknown arch' }))
+            Write-Host ("  {0,-24} : {1}Installed ({2}){3}" -f "Proxy version.dll", $C.Grn, $(if ($a) { $a } else { 'unknown arch' }), $C.Reset)
         } else {
-            Write-Info 'version.dll is not installed.'
+            Write-Host ("  {0,-24} : {1}Not installed{2}" -f "Proxy version.dll", $C.Dim, $C.Reset)
         }
         if (Test-Path -LiteralPath (Join-Path $appDir 'signatures.json') -PathType Leaf) {
-            Write-Ok 'signatures.json is present next to chrome.exe.'
+            Write-Host ("  {0,-24} : {1}Present beside chrome.exe{2}" -f "Signatures File", $C.Grn, $C.Reset)
         } elseif (Test-Path -LiteralPath (Join-Path $Mv2DataDir 'signatures.json') -PathType Leaf) {
-            Write-Info 'signatures.json is in the per-user store (the DLL refreshes it on launch).'
+            Write-Host ("  {0,-24} : {1}In per-user store{2}" -f "Signatures File", $C.Yel, $C.Reset)
         } else {
-            Write-Info 'No signatures.json yet (the DLL fetches it on first launch).'
+            Write-Host ("  {0,-24} : {1}Not found (fetches on launch){2}" -f "Signatures File", $C.Dim, $C.Reset)
         }
     } else {
-        Write-Warn "Couldn't find chrome.exe next to this Chrome."
+        Write-Host ("  {0,-24} : {1}chrome.exe not found in parent directory{2}" -f "Proxy version.dll", $C.Red, $C.Reset)
     }
 
+    # uBlock Origin extension status
     $uboKey = "HKLM\Software\Google\Chrome\Extensions\$UboId"
     $uboFound = $false
     foreach ($view in '64', '32') { if ((Invoke-Reg @('query', $uboKey, "/reg:$view")) -eq 0) { $uboFound = $true } }
-    if ($uboFound) { Write-Ok 'uBlock Origin (MV2) is registered to auto-install.' } else { Write-Info 'uBlock Origin is not registered.' }
+    if ($uboFound) {
+        Write-Host ("  {0,-24} : {1}Registered for auto-install{2}" -f "uBlock Origin MV2", $C.Grn, $C.Reset)
+    } else {
+        Write-Host ("  {0,-24} : {1}Not registered{2}" -f "uBlock Origin MV2", $C.Dim, $C.Reset)
+    }
 
+    # Chrome machine policies
     $polFound = $false
     foreach ($view in '64', '32') { if ((Invoke-Reg @('query', 'HKLM\Software\Policies\Google\Chrome', "/reg:$view")) -eq 0) { $polFound = $true } }
-    if ($polFound) { Write-Warn 'Chrome machine policies are set (may show a "managed by your organization" banner).' }
+    if ($polFound) {
+        Write-Host ("  {0,-24} : {1}Set (managed banner may show){2}" -f "Chrome Policies", $C.Yel, $C.Reset)
+    } else {
+        Write-Host ("  {0,-24} : {1}Clean (No enterprise policies){2}" -f "Chrome Policies", $C.Grn, $C.Reset)
+    }
 
     if (Test-Path -LiteralPath (Get-BackupPath $Target.Path) -PathType Leaf) {
         Write-Warn 'An old-style chrome.dll backup is present (install/uninstall will restore it).'
     } elseif ((Get-PatchStateQuick $Target.Path) -eq 'patched') {
         Write-Warn 'chrome.dll appears modified by the old byte-patcher (no backup found).'
     }
+
+    Write-Host "$($C.Bold)----------------------------------------------------------$($C.Reset)"
+    if ($installed -and $compat.Compatible) {
+        Write-Host "$($C.Bold)Verdict: $($C.Grn)SUPPORTED & FULLY CONFIGURED$($C.Reset)"
+    } elseif ($installed) {
+        Write-Host "$($C.Bold)Verdict: $($C.Yel)INSTALLED (Compatibility: $($compat.Status))$($C.Reset)"
+    } elseif ($compat.Compatible) {
+        Write-Host "$($C.Bold)Verdict: $($C.Grn)SUPPORTED & READY TO INSTALL$($C.Reset)"
+    } else {
+        Write-Host "$($C.Bold)Verdict: $($C.Red)UNSUPPORTED / UNVERIFIED ($($compat.Reason))$($C.Reset)"
+    }
+    Write-Host "$($C.Bold)==========================================================$($C.Reset)"
+    Write-Host ''
 
     return $(if ($installed) { 0 } else { 1 })
 }
