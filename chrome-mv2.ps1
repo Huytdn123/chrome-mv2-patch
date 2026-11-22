@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Chrome Manifest V2 installer - single-file, self-contained PowerShell for
     Windows (x64, x86, and arm64).
@@ -156,6 +156,7 @@ $script:CsLoaded = $false
 # what to do on a bare run. Captured at script scope where $PSBoundParameters
 # reflects the script's own arguments.
 $script:CommandExplicit = $PSBoundParameters.ContainsKey('Command')
+$script:Command         = if ($script:CommandExplicit) { $Command } else { '' }
 
 # Embedded Windows signature tables - see the .DESCRIPTION note. An external
 # signatures.json next to the script overrides this if present.
@@ -892,14 +893,21 @@ function Open-PeImage {
     if ($Buf.Length -lt 64) { throw "not a valid Chrome file: file too small" }
     $eLfanew = [BitConverter]::ToUInt32($Buf, 0x3C)
 
-    if (($eLfanew + 24) -gt $Buf.Length) { throw "not a valid Chrome file: truncated NT headers" }
+    if ($eLfanew -lt 64 -or ($eLfanew + 24) -gt $Buf.Length -or $eLfanew -gt 0x10000000) {
+        throw "not a valid Chrome file: invalid or truncated NT headers"
+    }
     if ($Buf[$eLfanew] -ne 0x50 -or $Buf[$eLfanew+1] -ne 0x45 -or
         $Buf[$eLfanew+2] -ne 0 -or $Buf[$eLfanew+3] -ne 0) { throw "not a valid Chrome file: bad NT signature" }
 
     $numSections  = [BitConverter]::ToUInt16($Buf, $eLfanew + 6)
+    if ($numSections -lt 1 -or $numSections -gt 96) {
+        throw "not a valid Chrome file: abnormal section count ($numSections)"
+    }
     $sizeOfOptHdr = [BitConverter]::ToUInt16($Buf, $eLfanew + 20)
     $optOff       = [int64]$eLfanew + 24
-    if (($optOff + $sizeOfOptHdr) -gt $Buf.Length) { throw "not a valid Chrome file: optional header out of bounds" }
+    if ($sizeOfOptHdr -lt 2 -or ($optOff + $sizeOfOptHdr) -gt $Buf.Length) {
+        throw "not a valid Chrome file: optional header out of bounds"
+    }
 
     $magic = [BitConverter]::ToUInt16($Buf, $optOff)
     switch ($magic) {
@@ -2475,22 +2483,13 @@ function Find-DllUnderApplication {
 # not the authoritative gate probe that 'check'/'patch' run.
 function Get-PatchStateQuick {
     param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
     try {
-        $hdr = [byte[]]::new(8192)
-        $fs = [IO.File]::OpenRead($Path)
-        try { $n = $fs.Read($hdr, 0, $hdr.Length) } finally { $fs.Dispose() }
-        if ($n -lt 64 -or $hdr[0] -ne 0x4D -or $hdr[1] -ne 0x5A) { return '' }
-        $eLfanew = [BitConverter]::ToUInt32($hdr, 0x3C)
-        if ($eLfanew + 24 -gt $n) { return '' }
-        if ($hdr[$eLfanew] -ne 0x50 -or $hdr[$eLfanew + 1] -ne 0x45) { return '' }
-        $optOff = [int]$eLfanew + 24
-        $magic = [BitConverter]::ToUInt16($hdr, $optOff)
-        $fixedLen = if ($magic -eq 0x20B) { 112 } elseif ($magic -eq 0x10B) { 96 } else { return '' }
-        $secDirAt = $optOff + $fixedLen + 4 * 8      # data directory [4] = Security
-        if ($secDirAt + 8 -gt $n) { return '' }
-        $va = [BitConverter]::ToUInt32($hdr, $secDirAt)
-        $sz = [BitConverter]::ToUInt32($hdr, $secDirAt + 4)
-        if ($va -ne 0 -and $sz -ne 0) { return 'not patched' } else { return 'patched' }
+        $fp = Get-PEFingerprint -Path $Path
+        if (-not $fp -or -not $fp.IsValidPE) { return '' }
+        if ($fp.Authenticode -eq 'Valid') { return 'not patched' }
+        if ($fp.Authenticode -eq 'HashMismatch') { return 'patched' }
+        return 'unknown'
     } catch { return '' }
 }
 
@@ -2738,21 +2737,12 @@ function Resolve-Target {
 # PE machine -> arch label, read from the file header only (no full read).
 function Get-PeArch {
     param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
     try {
-        $hdr = [byte[]]::new(4096)
-        $fs = [IO.File]::OpenRead($Path)
-        try { $n = $fs.Read($hdr, 0, $hdr.Length) } finally { $fs.Dispose() }
-        if ($n -lt 64 -or $hdr[0] -ne 0x4D -or $hdr[1] -ne 0x5A) { return '' }
-        $e = [int][BitConverter]::ToUInt32($hdr, 0x3C)
-        if ($e + 6 -gt $n) { return '' }
-        if ($hdr[$e] -ne 0x50 -or $hdr[$e + 1] -ne 0x45) { return '' }
-        switch ([BitConverter]::ToUInt16($hdr, $e + 4)) {
-            0x8664  { return 'x64' }
-            0x014C  { return 'x86' }
-            0xAA64  { return 'arm64' }
-            default { return '' }
-        }
-    } catch { return '' }
+        $fp = Get-PEFingerprint -Path $Path
+        if ($fp -and $fp.IsValidPE) { return $fp.Architecture }
+    } catch { }
+    return ''
 }
 
 # The arch of the version.dll to install: -Arch wins, else chrome.exe's machine
@@ -2850,21 +2840,90 @@ function Save-Signatures {
     Write-Ok ("Signatures saved ({0} Windows table(s))." -f $peCount)
 }
 
-# Wipe the Chrome machine-policy subtree in BOTH registry views. This clears the
-# old ExtensionSettings policy route and the "managed by your organization"
-# banner it left. reg.exe /reg:64|/reg:32 forces the view regardless of the
-# host's own bitness.
-function Remove-ChromePolicies {
-    $key = 'HKLM\Software\Policies\Google\Chrome'
-    $removed = $false
-    foreach ($view in '64', '32') {
-        if ((Invoke-Reg @('query', $key, "/reg:$view")) -eq 0) {
-            if ((Invoke-Reg @('delete', $key, '/f', "/reg:$view")) -eq 0) { $removed = $true }
-            else { Write-Warn "Couldn't remove Chrome policies ($view-bit view)." }
+# ============================================================================
+# Chrome Policy Audit & Preservation (Read-Only)
+# Never delete or overwrite organization, enterprise, or user policies.
+# ============================================================================
+
+function Get-ChromePolicyStatus {
+    $found = @()
+    $conflicts = @()
+    $roots = @(
+        @{ Hive = 'HKLM'; Path = 'HKLM\Software\Policies\Google\Chrome' },
+        @{ Hive = 'HKCU'; Path = 'HKCU\Software\Policies\Google\Chrome' }
+    )
+    foreach ($r in $roots) {
+        foreach ($view in '64', '32') {
+            $p = New-Object Diagnostics.ProcessStartInfo
+            $p.FileName = 'reg.exe'
+            $p.Arguments = "query `"$($r.Path)`" /reg:$view /s"
+            $p.UseShellExecute = $false
+            $p.RedirectStandardOutput = $true
+            $p.RedirectStandardError = $true
+            $p.CreateNoWindow = $true
+            try {
+                $proc = [Diagnostics.Process]::Start($p)
+                $stdout = $proc.StandardOutput.ReadToEnd()
+                $proc.WaitForExit()
+
+                if ($proc.ExitCode -eq 0 -and $stdout) {
+                    $lines = $stdout -split "`r?`n"
+                    $currentSubKey = $r.Path
+                    foreach ($line in $lines) {
+                        $trim = $line.Trim()
+                        if ($trim.StartsWith('HKEY_')) {
+                            $currentSubKey = $trim
+                        } elseif ($trim) {
+                            $parts = $trim -split '\s{2,}', 3
+                            if ($parts.Count -ge 2) {
+                                $valName = $parts[0].Trim()
+                                $valType = $parts[1].Trim()
+                                $valData = if ($parts.Count -ge 3) { $parts[2].Trim() } else { '' }
+                                $item = [pscustomobject]@{
+                                    Root    = $r.Hive
+                                    View    = "$view-bit"
+                                    KeyPath = $currentSubKey
+                                    Name    = $valName
+                                    Type    = $valType
+                                    Value   = $valData
+                                }
+                                $found += $item
+
+                                if ($valName -ieq 'ExtensionManifestV2Availability' -or
+                                    $valName -ieq 'ExtensionSettings' -or
+                                    $valName -ieq 'ExtensionInstallBlocklist' -or
+                                    $valName -ieq 'ExtensionInstallAllowlist') {
+                                    $conflicts += $item
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch { }
         }
     }
-    if ($removed) { Write-Ok 'Removed Chrome machine policies (clears the managed-UI banner).' }
-    else { Write-Info 'No Chrome machine policies to remove.' }
+    return [pscustomobject]@{
+        HasPolicies = ($found.Count -gt 0)
+        Count       = $found.Count
+        Policies    = $found
+        Conflicts   = $conflicts
+    }
+}
+
+function Audit-ChromePolicies {
+    param($Target)
+    $status = Get-ChromePolicyStatus
+    if (-not $status.HasPolicies) {
+        Write-Info 'No Chrome machine or user policies found.'
+        return
+    }
+    Write-Info ("Preserving {0} existing Chrome policy setting(s) (organization and user policies untouched)." -f $status.Count)
+    if ($status.Conflicts.Count -gt 0) {
+        foreach ($c in $status.Conflicts) {
+            Write-Warn ("Potential policy conflict detected: '{0}' ({1}) = {2} under [{3}]." -f $c.Name, $c.Type, $c.Value, $c.KeyPath)
+        }
+        Write-Host "    Existing enterprise policies are preserved and not modified by this tool."
+    }
 }
 
 # Off-store uBlock Origin (MV2). Written to BOTH the native and 32-bit views:
@@ -2916,72 +2975,178 @@ $SmartCacheFile = Join-Path $Mv2DataDir 'cache.json'
 
 function Get-PEFingerprint {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+
+    $fileItem = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    $fileLen = if ($fileItem) { $fileItem.Length } else { 0 }
 
     $fp = [ordered]@{
-        Path          = $Path
-        FileLength    = (Get-Item -LiteralPath $Path).Length
-        FileVersion   = ''
-        ProductVersion= ''
-        Architecture  = ''
-        Machine       = 0
-        TimeDateStamp = 0
-        TimeDateString= ''
-        SizeOfImage   = 0
-        CheckSum      = 0
-        Authenticode  = 'Unknown'
-        SHA256        = ''
+        Path           = $Path
+        FileLength     = $fileLen
+        FileVersion    = ''
+        ProductVersion = ''
+        Architecture   = ''
+        Machine        = 0
+        TimeDateStamp  = 0
+        TimeDateString = ''
+        SizeOfImage    = 0
+        CheckSum       = 0
+        Authenticode   = 'Unknown'
+        SHA256         = ''
+        IsValidPE      = $false
+        ValidationError= ''
     }
 
+    # 1. Bounds check: file size must be at least 64 bytes for DOS header
+    if ($fileLen -lt 64) {
+        $fp.ValidationError = "File too small ($fileLen bytes, minimum 64 bytes for DOS header)"
+        return [pscustomobject]$fp
+    }
+
+    # 2. Extract VersionInfo safely
     try {
         $vi = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
         if ($vi.FileVersion) { $fp.FileVersion = $vi.FileVersion.Trim() }
         if ($vi.ProductVersion) { $fp.ProductVersion = $vi.ProductVersion.Trim() }
     } catch { }
 
+    # 3. Authenticode Verification using Get-AuthenticodeSignature
     try {
-        $hdr = [byte[]]::new(4096)
-        $fs = [IO.File]::OpenRead($Path)
-        try { $n = $fs.Read($hdr, 0, $hdr.Length) } finally { $fs.Dispose() }
-        if ($n -ge 64 -and $hdr[0] -eq 0x4D -and $hdr[1] -eq 0x5A) {
-            $eLfanew = [BitConverter]::ToUInt32($hdr, 0x3C)
-            if ($eLfanew + 24 -le $n -and $hdr[$eLfanew] -eq 0x50 -and $hdr[$eLfanew + 1] -eq 0x45) {
-                $machine = [BitConverter]::ToUInt16($hdr, [int]$eLfanew + 4)
-                $timeDateStamp = [BitConverter]::ToUInt32($hdr, [int]$eLfanew + 8)
-                $fp.Machine = $machine
-                $fp.TimeDateStamp = $timeDateStamp
-                try {
-                    $dt = (Get-Date '1970-01-01 00:00:00Z').AddSeconds($timeDateStamp).ToLocalTime()
-                    $fp.TimeDateString = $dt.ToString('yyyy-MM-dd HH:mm:ss')
-                } catch { }
-
-                $optOff = [int]$eLfanew + 24
-                $magic = [BitConverter]::ToUInt16($hdr, $optOff)
-                $fp.Architecture = switch ($machine) {
-                    0x8664  { 'x64' }
-                    0x014C  { 'x86' }
-                    0xAA64  { 'arm64' }
-                    default { '' }
-                }
-
-                $fixedLen = if ($magic -eq 0x20B) { 112 } elseif ($magic -eq 0x10B) { 96 } else { 0 }
-                if ($fixedLen -gt 0) {
-                    $fp.SizeOfImage = [BitConverter]::ToUInt32($hdr, $optOff + 56)
-                    $fp.CheckSum = [BitConverter]::ToUInt32($hdr, $optOff + 64)
-                    $secDirAt = $optOff + $fixedLen + 4 * 8
-                    if ($secDirAt + 8 -le $n) {
-                        $va = [BitConverter]::ToUInt32($hdr, $secDirAt)
-                        $sz = [BitConverter]::ToUInt32($hdr, $secDirAt + 4)
-                        $fp.Authenticode = if ($va -ne 0 -and $sz -ne 0) { 'Signed (Authenticode)' } else { 'Modified/Stripped' }
-                    }
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction SilentlyContinue
+        if ($sig) {
+            $fp.Authenticode = switch ($sig.Status) {
+                ([System.Management.Automation.SignatureStatus]::Valid)        { 'Valid' }
+                ([System.Management.Automation.SignatureStatus]::NotSigned)    { 'NotSigned' }
+                ([System.Management.Automation.SignatureStatus]::HashMismatch) { 'HashMismatch' }
+                ([System.Management.Automation.SignatureStatus]::NotTrusted)   { 'NotTrusted' }
+                default {
+                    if ($sig.Status) { "$($sig.Status)" } else { 'Unknown' }
                 }
             }
+        } else {
+            $fp.Authenticode = 'Unknown'
         }
-    } catch { }
+    } catch {
+        $fp.Authenticode = 'Unknown'
+    }
 
+    # 4. SHA-256 Checksum
     try {
         $fp.SHA256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
     } catch { }
+
+    # 5. Robust Bounds-Checked PE Header Parsing
+    $fs = $null
+    try {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $dosHdr = [byte[]]::new(64)
+        $readBytes = $fs.Read($dosHdr, 0, 64)
+        if ($readBytes -lt 64 -or $dosHdr[0] -ne 0x4D -or $dosHdr[1] -ne 0x5A) {
+            $fp.ValidationError = 'Invalid DOS signature (expected MZ)'
+            return [pscustomobject]$fp
+        }
+
+        # Read e_lfanew at 0x3C
+        $eLfanew = [BitConverter]::ToUInt32($dosHdr, 0x3C)
+
+        # Validate e_lfanew bounds:
+        # Minimum: 64 (after DOS header)
+        # Maximum: FileLength - 24 (must fit 4 bytes NT signature + 20 bytes COFF header)
+        if ($eLfanew -lt 64 -or ($eLfanew + 24) -gt $fileLen -or $eLfanew -gt 0x10000000) {
+            $fp.ValidationError = "e_lfanew offset (0x$([Convert]::ToString($eLfanew, 16))) out of file bounds (file size: $fileLen bytes)"
+            return [pscustomobject]$fp
+        }
+
+        # Seek to NT header
+        [void]$fs.Seek($eLfanew, [IO.SeekOrigin]::Begin)
+        $ntHdr = [byte[]]::new(24)
+        $readBytes = $fs.Read($ntHdr, 0, 24)
+        if ($readBytes -lt 24) {
+            $fp.ValidationError = 'Truncated NT header'
+            return [pscustomobject]$fp
+        }
+
+        # Check PE\0\0 signature
+        if ($ntHdr[0] -ne 0x50 -or $ntHdr[1] -ne 0x45 -or $ntHdr[2] -ne 0 -or $ntHdr[3] -ne 0) {
+            $fp.ValidationError = 'Invalid PE NT signature (expected PE\0\0)'
+            return [pscustomobject]$fp
+        }
+
+        # COFF File Header
+        $machine = [BitConverter]::ToUInt16($ntHdr, 4)
+        $numSections = [BitConverter]::ToUInt16($ntHdr, 6)
+        $timeDateStamp = [BitConverter]::ToUInt32($ntHdr, 8)
+        $sizeOfOptHdr = [BitConverter]::ToUInt16($ntHdr, 20)
+
+        $fp.Machine = $machine
+        $fp.TimeDateStamp = $timeDateStamp
+        try {
+            $dt = (Get-Date '1970-01-01 00:00:00Z').AddSeconds($timeDateStamp).ToLocalTime()
+            $fp.TimeDateString = $dt.ToString('yyyy-MM-dd HH:mm:ss')
+        } catch { }
+
+        $arch = switch ($machine) {
+            0x8664  { 'x64' }
+            0x014C  { 'x86' }
+            0xAA64  { 'arm64' }
+            default { '' }
+        }
+        if (-not $arch) {
+            $fp.ValidationError = "Unsupported PE machine architecture (0x$([Convert]::ToString($machine, 16)))"
+            return [pscustomobject]$fp
+        }
+        $fp.Architecture = $arch
+
+        # Optional Header Bounds
+        $optOff = [int64]$eLfanew + 24
+        if ($sizeOfOptHdr -lt 2 -or ($optOff + $sizeOfOptHdr) -gt $fileLen) {
+            $fp.ValidationError = "Optional header out of bounds or truncated (size: $sizeOfOptHdr, file size: $fileLen)"
+            return [pscustomobject]$fp
+        }
+
+        $optBytesToRead = [Math]::Min([int]$sizeOfOptHdr, 256)
+        $optBuf = [byte[]]::new($optBytesToRead)
+        [void]$fs.Seek($optOff, [IO.SeekOrigin]::Begin)
+        $readBytes = $fs.Read($optBuf, 0, $optBytesToRead)
+        if ($readBytes -lt 2) {
+            $fp.ValidationError = 'Could not read optional header magic'
+            return [pscustomobject]$fp
+        }
+
+        $magic = [BitConverter]::ToUInt16($optBuf, 0)
+        $fixedLen = if ($magic -eq 0x20B) { 112 } elseif ($magic -eq 0x10B) { 96 } else { 0 }
+        if ($fixedLen -eq 0) {
+            $fp.ValidationError = "Unsupported optional header magic (0x$([Convert]::ToString($magic, 16)))"
+            return [pscustomobject]$fp
+        }
+        if ($sizeOfOptHdr -lt $fixedLen -or $readBytes -lt $fixedLen) {
+            $fp.ValidationError = "Optional header size ($sizeOfOptHdr) is smaller than required fixed length ($fixedLen)"
+            return [pscustomobject]$fp
+        }
+
+        $fp.SizeOfImage = [BitConverter]::ToUInt32($optBuf, 56)
+        $fp.CheckSum = [BitConverter]::ToUInt32($optBuf, 64)
+
+        # Section Table Bounds
+        $secTableOff = [int64]$optOff + $sizeOfOptHdr
+        $secTableBytes = [int64]$numSections * 40
+        if ($numSections -lt 1 -or $numSections -gt 96) {
+            $fp.ValidationError = "Abnormal section count ($numSections sections)"
+            return [pscustomobject]$fp
+        }
+        if (($secTableOff + $secTableBytes) -gt $fileLen) {
+            $fp.ValidationError = "Section table exceeds file length (offset: $secTableOff, size: $secTableBytes, file size: $fileLen)"
+            return [pscustomobject]$fp
+        }
+
+        # Successfully passed all structural checks
+        $fp.IsValidPE = $true
+    } catch {
+        $fp.ValidationError = "PE parsing exception: $($_.Exception.Message)"
+        $fp.IsValidPE = $false
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
 
     return [pscustomobject]$fp
 }
@@ -2995,7 +3160,12 @@ function Get-SmartCache {
         $raw = Get-Content -LiteralPath $SmartCacheFile -Raw
         $cacheDoc = $raw | ConvertFrom-Json
         if (-not $cacheDoc -or -not $cacheDoc.PSObject.Properties['Entries']) {
-            return [pscustomobject]@{ Status = 'MISS'; Entry = $null }
+            return [pscustomobject]@{ Status = 'CORRUPT'; Entry = $null }
+        }
+        if ($cacheDoc.PSObject.Properties['SchemaVersion']) {
+            if ($cacheDoc.SchemaVersion -ne 2) {
+                return [pscustomobject]@{ Status = 'STALE_SCHEMA'; Entry = $null }
+            }
         }
         $key = [IO.Path]::GetFullPath($ImagePath).ToLowerInvariant()
         $entryProp = $cacheDoc.Entries.PSObject.Properties[$key]
@@ -3004,13 +3174,25 @@ function Get-SmartCache {
         }
         $entry = $entryProp.Value
 
+        # Validate entry required properties
+        foreach ($prop in 'FileLength', 'TimeDateStamp', 'Architecture', 'SHA256', 'Status', 'TotalGates', 'LocatedGates') {
+            if (-not $entry.PSObject.Properties[$prop]) {
+                return [pscustomobject]@{ Status = 'CORRUPT'; Entry = $null }
+            }
+        }
+
         if ($Fingerprint) {
+            # Bắt buộc SHA-256 tồn tại và trùng khớp mới được xét HIT
+            if (-not $Fingerprint.SHA256 -or -not $entry.SHA256 -or ($Fingerprint.SHA256.Length -ne 64)) {
+                return [pscustomobject]@{ Status = 'STALE'; Entry = $entry }
+            }
+            if ($entry.SHA256 -ne $Fingerprint.SHA256) {
+                return [pscustomobject]@{ Status = 'STALE'; Entry = $entry }
+            }
+
             $isMatch = ($entry.FileLength -eq $Fingerprint.FileLength) -and
                        ($entry.TimeDateStamp -eq $Fingerprint.TimeDateStamp) -and
                        ($entry.Architecture -eq $Fingerprint.Architecture)
-            if ($Fingerprint.SHA256 -and $entry.SHA256) {
-                if ($entry.SHA256 -ne $Fingerprint.SHA256) { $isMatch = $false }
-            }
             if (-not $isMatch) {
                 return [pscustomobject]@{ Status = 'STALE'; Entry = $entry }
             }
@@ -3031,25 +3213,27 @@ function Set-SmartCache {
         if (Test-Path -LiteralPath $SmartCacheFile -PathType Leaf) {
             try { $cacheDoc = Get-Content -LiteralPath $SmartCacheFile -Raw | ConvertFrom-Json } catch { }
         }
-        if (-not $cacheDoc -or -not $cacheDoc.PSObject.Properties['Entries']) {
+        if (-not $cacheDoc -or -not $cacheDoc.PSObject.Properties['Entries'] -or $cacheDoc.SchemaVersion -ne 2) {
             $cacheDoc = [pscustomobject]@{
-                Version = 1
-                Entries = [pscustomobject]@{}
+                SchemaVersion = 2
+                Version       = 2
+                Entries       = [pscustomobject]@{}
             }
         }
         $key = [IO.Path]::GetFullPath($ImagePath).ToLowerInvariant()
         $entry = [ordered]@{
             ImagePath       = $ImagePath
-            FileLength      = $Fingerprint.FileLength
-            TimeDateStamp   = $Fingerprint.TimeDateStamp
-            TimeDateString  = $Fingerprint.TimeDateString
-            Architecture    = $Fingerprint.Architecture
-            FileVersion     = $Fingerprint.FileVersion
-            SHA256          = $Fingerprint.SHA256
-            Milestone       = $Analysis.Milestone
-            Status          = $Analysis.Status
-            TotalGates      = $Analysis.Total
-            LocatedGates    = $Analysis.Located
+            FileLength      = [long]$Fingerprint.FileLength
+            TimeDateStamp   = [uint32]$Fingerprint.TimeDateStamp
+            TimeDateString  = [string]$Fingerprint.TimeDateString
+            Architecture    = [string]$Fingerprint.Architecture
+            FileVersion     = [string]$Fingerprint.FileVersion
+            SHA256          = [string]$Fingerprint.SHA256
+            Authenticode    = [string]$Fingerprint.Authenticode
+            Milestone       = [string]$Analysis.Milestone
+            Status          = [string]$Analysis.Status
+            TotalGates      = [int]$Analysis.Total
+            LocatedGates    = [int]$Analysis.Located
             VerifiedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         }
         $cacheDoc.Entries | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]$entry) -Force
@@ -3083,11 +3267,24 @@ function Test-ChromeMV2Compatibility {
     }
 
     $fp = Get-PEFingerprint -Path $targetDll
-    if (-not $fp.Architecture) {
+    if (-not $fp -or -not $fp.IsValidPE) {
+        $reason = if ($fp -and $fp.ValidationError) { $fp.ValidationError } else { "Target is not a valid Windows PE binary." }
         return [pscustomobject]@{
             Compatible   = $false
             Status       = 'INVALID_PE'
-            Reason       = "Target is not a supported Windows PE binary."
+            Reason       = $reason
+            Fingerprint  = $fp
+            Analysis     = $null
+            CacheStatus  = 'NONE'
+        }
+    }
+
+    # Authenticode Verification Policy: Fail-Closed on HashMismatch!
+    if ($fp.Authenticode -eq 'HashMismatch') {
+        return [pscustomobject]@{
+            Compatible   = $false
+            Status       = 'AUTHENTICODE_HASH_MISMATCH'
+            Reason       = "Security rejection: Authenticode signature hash mismatch. The binary has been modified, corrupted, or tampered with (Fail-Closed)."
             Fingerprint  = $fp
             Analysis     = $null
             CacheStatus  = 'NONE'
@@ -3212,7 +3409,7 @@ function Invoke-Install {
 
     # Pre-flight Intelligent Signature & Fingerprint verification (Fail-Closed Safety)
     Write-Info 'Running pre-flight Intelligent Signature & Fingerprint verification...'
-    $compat = Test-ChromeMV2Compatibility -Target $Target
+    $compat = Test-ChromeMV2Compatibility -Target $Target -ForceRescan $true
     if (-not $compat.Compatible) {
         Write-Err 'Pre-flight compatibility verification failed!'
         Write-Host "    Target: $($Target.Path)"
@@ -3299,8 +3496,8 @@ function Invoke-Install {
         }
     }
 
-    # (4) Clear machine policies (managed banner + old policy route).
-    Remove-ChromePolicies
+    # (4) Audit and preserve Chrome policies (do NOT delete organization policies).
+    Audit-ChromePolicies -Target $Target
 
     # (5) Optional off-store uBlock Origin (MV2).
     $doUbo = if ($Ublock) { $true }
@@ -3460,7 +3657,21 @@ function Invoke-Check {
         $verDisp = if ($fp.FileVersion) { "$($fp.FileVersion) ($($fp.Architecture))" } else { "Unknown ($($fp.Architecture))" }
         Write-Host ("  {0,-24} : {1}" -f "Chrome Version", $verDisp)
         Write-Host ("  {0,-24} : Timestamp: {1} | Size: {2:N0} bytes" -f "PE Fingerprint", $fp.TimeDateString, $fp.FileLength)
-        Write-Host ("  {0,-24} : {1}" -f "Authenticode Status", $fp.Authenticode)
+        $authColor = switch ($fp.Authenticode) {
+            'Valid'        { $C.Grn }
+            'NotSigned'    { $C.Dim }
+            'HashMismatch' { $C.Red }
+            'NotTrusted'   { $C.Yel }
+            default        { $C.Dim }
+        }
+        $authDisp = switch ($fp.Authenticode) {
+            'Valid'        { 'Valid (Digitally signed by trusted publisher)' }
+            'NotSigned'    { 'Not signed (Unsigned / Dev binary)' }
+            'HashMismatch' { 'Hash Mismatch (TAMPERED OR CORRUPTED - Insecure!)' }
+            'NotTrusted'   { 'Not Trusted (Self-signed or untrusted root)' }
+            default        { if ($fp.Authenticode) { $fp.Authenticode } else { 'Unknown' } }
+        }
+        Write-Host ("  {0,-24} : {1}{2}{3}" -f "Authenticode Status", $authColor, $authDisp, $C.Reset)
         if ($fp.SHA256) {
             $shaShort = if ($fp.SHA256.Length -ge 16) { $fp.SHA256.Substring(0, 16) + '...' } else { $fp.SHA256 }
             Write-Host ("  {0,-24} : {1}" -f "SHA-256 (prefix)", $shaShort)
@@ -3508,13 +3719,18 @@ function Invoke-Check {
         Write-Host ("  {0,-24} : {1}Not registered{2}" -f "uBlock Origin MV2", $C.Dim, $C.Reset)
     }
 
-    # Chrome machine policies
-    $polFound = $false
-    foreach ($view in '64', '32') { if ((Invoke-Reg @('query', 'HKLM\Software\Policies\Google\Chrome', "/reg:$view")) -eq 0) { $polFound = $true } }
-    if ($polFound) {
-        Write-Host ("  {0,-24} : {1}Set (managed banner may show){2}" -f "Chrome Policies", $C.Yel, $C.Reset)
+    # Chrome machine & user policies (read-only audit, preserve untouched)
+    $polStatus = Get-ChromePolicyStatus
+    if ($polStatus.HasPolicies) {
+        $polColor = if ($polStatus.Conflicts.Count -gt 0) { $C.Yel } else { $C.Dim }
+        $polMsg = if ($polStatus.Conflicts.Count -gt 0) {
+            "{0} policies detected ({1} conflicting key(s) detected: {2})" -f $polStatus.Count, $polStatus.Conflicts.Count, (($polStatus.Conflicts | ForEach-Object { $_.Name }) -join ', ')
+        } else {
+            "{0} policies detected (Preserved untouched)" -f $polStatus.Count
+        }
+        Write-Host ("  {0,-24} : {1}{2}{3}" -f "Chrome Policies", $polColor, $polMsg, $C.Reset)
     } else {
-        Write-Host ("  {0,-24} : {1}Clean (No enterprise policies){2}" -f "Chrome Policies", $C.Grn, $C.Reset)
+        Write-Host ("  {0,-24} : {1}None configured{2}" -f "Chrome Policies", $C.Grn, $C.Reset)
     }
 
     if (Test-Path -LiteralPath (Get-BackupPath $Target.Path) -PathType Leaf) {
