@@ -450,7 +450,7 @@ static std::vector<Milestone> ParseMilestones(const JV& doc,
 // ---------------------------------------------------------------------------
 
 static const wchar_t* kDefaultSigUrl =
-    L"https://github.com/Sketchystan1/chrome-mv2-patch/raw/master/signatures.json";
+    L"https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/v1.16.0/signatures.json";
 
 struct Config {
   std::wstring signatures = kDefaultSigUrl;

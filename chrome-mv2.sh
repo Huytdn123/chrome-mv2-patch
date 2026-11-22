@@ -236,7 +236,7 @@ is_macho() { [[ "$(detect_container_kind "$1")" == "macho" ]]; }
 # --signatures, because a pre-tokenized table used to be embedded here).
 # ============================================================================
 readonly SIGNATURES_FILE="signatures.json"
-readonly SIGNATURES_URL="https://github.com/Sketchystan1/chrome-mv2-patch/raw/master/signatures.json"
+readonly SIGNATURES_URL="https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/v1.16.0/signatures.json"
 SIGNATURES_OVERRIDE=""
 
 # Download the canonical signatures.json (curl, else wget). Prints JSON to stdout.

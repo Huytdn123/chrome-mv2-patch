@@ -85,7 +85,7 @@
     .\chrome-mv2.ps1 update
 .EXAMPLE
     # Run directly from a URL (self-elevates via UAC; keep the window open):
-    powershell -ExecutionPolicy Bypass -c "irm https://github.com/Sketchystan1/chrome-mv2-patch/raw/master/chrome-mv2.ps1 | iex"
+    powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/main/chrome-mv2.ps1 | iex"
 #>
 
 [CmdletBinding()]
@@ -135,13 +135,15 @@ $ErrorActionPreference = 'Stop'
 
 $AppVersion      = '1.16.0'
 $SignaturesFile  = 'signatures.json'
-$SignaturesUrl   = 'https://github.com/Sketchystan1/chrome-mv2-patch/raw/master/signatures.json'
-# version.dll release: the latest GitHub release's version.dll-v<ver>.zip asset
-# (x64/, x86/, arm64/ folders inside). Found by following the releases/latest
-# redirect to the tag - NOT via api.github.com, which is rate-limited by IP
-# (403 for many shared/VPN addresses). win-build.yml names the asset after the
-# tag, so the tag alone gives the download URL. Built by win-build.yml.
-$DllReleaseLatest = 'https://github.com/Sketchystan1/chrome-mv2-patch/releases/latest'
+$SignaturesUrl   = 'https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/v1.16.0/signatures.json'
+# Pinned version.dll release v1.16.0 on Huytdn123/chrome-mv2-patch
+$DllReleaseZipUrl = 'https://github.com/Huytdn123/chrome-mv2-patch/releases/download/v1.16.0/version.dll-v1.16.0.zip'
+$ExpectedZipSha256 = 'FD7CF43ADEAC73375F83E956F2E43B5BF84506C4B6AF5245557225DCB9B68B5F'
+$ExpectedDllSha256 = @{
+    'x64'   = '8544C3229C8E0E4D075CDE78AC04E072BF9AC201101A031BD1D3E12211FC78A0'
+    'x86'   = '008238E5739C2FC52A07168E9E6F553116E3166C4508251728891D7829D2A430'
+    'arm64' = '77B91E8836CDB81B2CAAD996C9FCF35DACD918558FDA9DF85F4FA61C3621861A'
+}
 # Off-store uBlock Origin (MV2) force-install.
 $UboId           = 'fkgkibajhfbepljeaefdnfnegdcjomkh'
 $UboUpdateUrl    = 'https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml'
@@ -1946,7 +1948,8 @@ function Invoke-SelfElevate {
     }
 
     try {
-        $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Get-QuotedArg $scriptPath), $Command)
+        $effectiveCmd = if ($script:Command) { $script:Command } else { $Command }
+        $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Get-QuotedArg $scriptPath), $effectiveCmd)
         if ($ResolvedTargetPath)  { $argv += (Get-QuotedArg $ResolvedTargetPath) }
         if ($Yes)   { $argv += '-Yes' }
         if ($Quiet) { $argv += '-Quiet' }
@@ -2370,22 +2373,42 @@ function Get-ChannelFromPath {
 # parts). Used to label the target and to skip non-version subdirectories.
 function Test-LooksLikeVersion {
     param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
     $parts = $Name -split '\.'
-    if ($parts.Count -lt 3) { return $false }
-    foreach ($p in $parts) { if ($p -eq '' -or $p -notmatch '^\d+$') { return $false } }
+    if ($parts.Count -lt 3 -or $parts.Count -gt 5) { return $false }
+    foreach ($p in $parts) {
+        if ($p -eq '' -or $p -notmatch '^\d{1,10}$') { return $false }
+        $val = 0L
+        if (-not [long]::TryParse($p, [ref]$val) -or $val -lt 0) { return $false }
+    }
     return $true
 }
 
-# Numeric version compare over up to 4 parts, so "151.0.7922.99" sorts below
-# "151.0.7922.109" (a plain string compare would not).
+# Numeric version compare over parts, safe from Int32 overflow so "151.0.7922.99"
+# sorts below "151.0.7922.109" (a plain string compare would not).
 function Compare-Version {
     param([string]$A, [string]$B)   # returns $true if A < B
-    $pa = @($A -split '\.' | ForEach-Object { [int]($_ -replace '\D', '0') })
-    $pb = @($B -split '\.' | ForEach-Object { [int]($_ -replace '\D', '0') })
-    for ($i = 0; $i -lt 4; $i++) {
-        $x = if ($i -lt $pa.Count) { $pa[$i] } else { 0 }
-        $y = if ($i -lt $pb.Count) { $pb[$i] } else { 0 }
-        if ($x -ne $y) { return ($x -lt $y) }
+    $splitA = $A -split '\.'
+    $splitB = $B -split '\.'
+    $maxLen = [Math]::Max($splitA.Count, $splitB.Count)
+    for ($i = 0; $i -lt $maxLen; $i++) {
+        $valA = 0L
+        $valB = 0L
+        if ($i -lt $splitA.Count) {
+            $digitsA = $splitA[$i] -replace '\D', ''
+            if ($digitsA.Length -gt 0) {
+                if ($digitsA.Length -gt 18) { $digitsA = $digitsA.Substring(0, 18) }
+                [void][long]::TryParse($digitsA, [ref]$valA)
+            }
+        }
+        if ($i -lt $splitB.Count) {
+            $digitsB = $splitB[$i] -replace '\D', ''
+            if ($digitsB.Length -gt 0) {
+                if ($digitsB.Length -gt 18) { $digitsB = $digitsB.Substring(0, 18) }
+                [void][long]::TryParse($digitsB, [ref]$valB)
+            }
+        }
+        if ($valA -ne $valB) { return ($valA -lt $valB) }
     }
     return $false
 }
@@ -2428,8 +2451,12 @@ function Find-DllUnderApplication {
     if (Test-Path -LiteralPath $AppDir -PathType Container) {
         $best = ''
         foreach ($d in Get-ChildItem -LiteralPath $AppDir -Directory -ErrorAction SilentlyContinue) {
+            # Skip any directory that does not match a valid Chrome version structure
+            if (-not (Test-LooksLikeVersion $d.Name)) { continue }
+            $candidateDll = Join-Path $d.FullName 'chrome.dll'
+            if (-not (Test-Path -LiteralPath $candidateDll -PathType Leaf)) { continue }
             if ($best -eq '' -or (Compare-Version $best $d.Name)) {
-                if (Test-Path -LiteralPath (Join-Path $d.FullName 'chrome.dll') -PathType Leaf) { $best = $d.Name }
+                $best = $d.Name
             }
         }
         if ($best -ne '') { return (Join-Path (Join-Path $AppDir $best) 'chrome.dll') }
@@ -2629,21 +2656,26 @@ function Select-Install {
     Write-Host ''
     Write-Host "$($C.Bold)What would you like to do?$($C.Reset)"
     Write-Host ''
-    Write-Host '  [i]  Install / repair MV2         (default)'
-    Write-Host '  [u]  Uninstall (remove version.dll + uBlock Origin)'
-    Write-Host '  [s]  Update signatures'
-    Write-Host '  [k]  Check status'
-    Write-Host '  [q]  Quit'
+    Write-Host '  [1/i]  Install / repair MV2         (default)'
+    Write-Host '  [2/u]  Uninstall (remove version.dll + uBlock Origin)'
+    Write-Host '  [3/s]  Update signatures'
+    Write-Host '  [4/k]  Check status'
+    Write-Host '  [5/q]  Quit'
     while ($true) {
         $act = (Read-Host "`nChoice").Trim().ToLower()
         switch ($act) {
-            ''  { $script:Command = 'install';   return $sel }
-            'i' { $script:Command = 'install';   return $sel }
-            'u' { $script:Command = 'uninstall'; return $sel }
-            's' { $script:Command = 'update';    return $sel }
-            'k' { $script:Command = 'check';     return $sel }
-            'q' { return $null }
-            default { Write-Err 'Enter i, u, s, k, or q.' }
+            ''    { $script:Command = 'install';   return $sel }
+            '1'   { $script:Command = 'install';   return $sel }
+            'i'   { $script:Command = 'install';   return $sel }
+            '2'   { $script:Command = 'uninstall'; return $sel }
+            'u'   { $script:Command = 'uninstall'; return $sel }
+            '3'   { $script:Command = 'update';    return $sel }
+            's'   { $script:Command = 'update';    return $sel }
+            '4'   { $script:Command = 'check';     return $sel }
+            'k'   { $script:Command = 'check';     return $sel }
+            '5'   { return $null }
+            'q'   { return $null }
+            default { Write-Err 'Enter 1-5 or i, u, s, k, q.' }
         }
     }
 }
@@ -2752,41 +2784,11 @@ function Get-RemoteFile {
     finally { $ProgressPreference = $old }
 }
 
-# Resolve the latest release without the GitHub API: github.com's plain
-# releases/latest URL 302-redirects to the release's tag (a repo with no
-# releases redirects to the bare /releases page), and win-build.yml names the
-# zip deterministically after the tag, so no asset listing is needed.
+# Pinned release v1.16.0 on Huytdn123/chrome-mv2-patch without depending on /releases/latest redirect
 function Get-LatestDllRelease {
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-    $req = [Net.HttpWebRequest]::Create($DllReleaseLatest)
-    $req.AllowAutoRedirect = $false
-    $req.UserAgent = 'chrome-mv2-patch'
-    $req.Timeout   = 30000
-    $loc = $null
-    try {
-        $resp = $req.GetResponse()
-        $loc  = $resp.Headers['Location']
-        $resp.Close()
-    } catch [Net.WebException] {
-        $r = $_.Exception.Response
-        if ($r) {
-            $code = [int]$r.StatusCode
-            $r.Close()
-            throw "GitHub answered HTTP $code for the latest release."
-        }
-        throw "Couldn't reach GitHub for the latest release: $($_.Exception.Message)"
-    }
-    $tag = $null
-    if ($loc -match '/(?:releases/)?(?:tag|tree)/([^/?#]+)') { $tag = $Matches[1] }
-    if (-not $tag) { throw 'No release has been published yet (run the win-build workflow on GitHub).' }
-    if ($tag -notmatch '^v[0-9][0-9.]*$') {
-        throw "The latest release tag '$tag' is not a version.dll build."
-    }
-    $zip  = "version.dll-$tag.zip"
-    $base = $DllReleaseLatest -replace '/releases/latest/?$',''
     return [pscustomobject]@{
-        ZipName = $zip
-        ZipUrl  = "$base/releases/download/$tag/$zip"
+        ZipName = "version.dll-v$AppVersion.zip"
+        ZipUrl  = $DllReleaseZipUrl
     }
 }
 
@@ -2817,9 +2819,10 @@ function Get-DllFromReleaseZip {
 function Save-Signatures {
     param([string]$AppDir)
     Write-Info 'Fetching signatures...'
-    if ($Signatures -and (Test-Path -LiteralPath $Signatures -PathType Leaf)) {
-        $raw = Get-Content -LiteralPath $Signatures -Raw
-        $src = $Signatures
+    $localSigPath = Get-SignaturesPath
+    if ($localSigPath) {
+        $raw = Get-Content -LiteralPath $localSigPath -Raw
+        $src = $localSigPath
     } else {
         $src = if ($Signatures) { $Signatures } else { $SignaturesUrl }
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
@@ -2942,7 +2945,23 @@ function Invoke-Install {
         $rel = Get-LatestDllRelease
         Write-Info "Downloading $($rel.ZipName) ($arch)..."
         Get-RemoteFile -Uri $rel.ZipUrl -OutFile $tmpZip
+
+        # Verify ZIP SHA-256 before extraction
+        $actualZipHash = (Get-FileHash -LiteralPath $tmpZip -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actualZipHash -ne $ExpectedZipSha256) {
+            throw "SHA-256 verification failed for version.dll package! Expected: $ExpectedZipSha256, Got: $actualZipHash"
+        }
+
         $dllBytes = Get-DllFromReleaseZip -ZipPath $tmpZip -Arch $arch
+
+        # Verify DLL SHA-256 before installation
+        $shaProvider = [System.Security.Cryptography.SHA256]::Create()
+        $actualDllHash = -join ($shaProvider.ComputeHash($dllBytes) | ForEach-Object { '{0:X2}' -f $_ })
+        $expectedArchHash = $ExpectedDllSha256[$arch]
+        if ($expectedArchHash -and ($actualDllHash -ne $expectedArchHash)) {
+            throw "SHA-256 verification failed for $arch version.dll! Expected: $expectedArchHash, Got: $actualDllHash"
+        }
+
         [IO.File]::WriteAllBytes($tmpDll, $dllBytes)
         $gotArch = Get-PeArch $tmpDll
         if ($gotArch -ne $arch) {
@@ -3190,10 +3209,10 @@ function Invoke-Main {
     # Deferred param validation (see the param block): empty values are leftover
     # session variables under `irm | iex`, not user input, so they mean "not
     # supplied". -notcontains is case-insensitive, like [ValidateSet] was.
-    if ([string]::IsNullOrWhiteSpace($Command)) { $Command = 'install' }
-    if ([string]::IsNullOrWhiteSpace($Arch))    { $Arch = '' }
-    if (@('install', 'uninstall', 'update', 'check', 'patch', 'restore') -notcontains $Command) {
-        Write-Err "Unknown command '$Command'. Use install, uninstall, update, or check."
+    if ([string]::IsNullOrWhiteSpace($script:Command)) { $script:Command = 'install' }
+    if ([string]::IsNullOrWhiteSpace($Arch))           { $Arch = '' }
+    if (@('install', 'uninstall', 'update', 'check', 'patch', 'restore') -notcontains $script:Command) {
+        Write-Err "Unknown command '$($script:Command)'. Use install, uninstall, update, or check."
         return 1
     }
     if ($Arch -and @('x64', 'x86', 'arm64') -notcontains $Arch) {
@@ -3202,8 +3221,9 @@ function Invoke-Main {
     }
 
     # patch/restore are accepted as aliases for install/uninstall.
-    if ($Command -eq 'patch')      { $script:Command = 'install' }
-    elseif ($Command -eq 'restore') { $script:Command = 'uninstall' }
+    if ($script:Command -eq 'patch')        { $script:Command = 'install' }
+    elseif ($script:Command -eq 'restore')  { $script:Command = 'uninstall' }
+    $Command = $script:Command
 
     # Resolve before elevation. Read-only checks never need admin, and an
     # offline/user-owned copy should not cause a UAC prompt merely because the
@@ -3211,19 +3231,22 @@ function Invoke-Main {
     $target = Resolve-Target -TargetPath $Path -Interactive (-not $Quiet)
     if (-not $target) { return 1 }
 
+    # Sync local $Command with $script:Command (which might have been updated in Select-Install)
+    $Command = $script:Command
+
     $selName = Get-BrowserDisplayName $target.Channel
     $selVer = Get-ChromeVersion -Target $target
     if ($selVer) { Write-Ok "Selected browser: $selName $selVer" }
     else         { Write-Ok "Selected browser: $selName" }
 
-    if ($Command -eq 'check') { return (Invoke-Check -Target $target) }
+    if ($script:Command -eq 'check') { return (Invoke-Check -Target $target) }
 
     # install/uninstall write HKLM (policies + uBO), so they always need admin;
     # update only writes files, so it needs admin only when the Application dir
     # is read-only. The probe is where version.dll / signatures.json will go.
     $appDirForElev = Get-AppDir $target
     $elevProbe = if ($appDirForElev) { Join-Path $appDirForElev 'version.dll' } else { $target.Path }
-    $needsElevation = ($Command -in 'install', 'uninstall') -or (-not (Test-TargetDirectoryWritable -TargetPath $elevProbe))
+    $needsElevation = ($script:Command -in 'install', 'uninstall') -or (-not (Test-TargetDirectoryWritable -TargetPath $elevProbe))
     if ($needsElevation -and -not (Test-Elevated) -and -not $env:MV2_TEST_NO_ELEVATION) {
         # Loop guard: -Relaunched means we ALREADY tried to elevate. If we are
         # still not admin, report and stop instead of spawning again.
@@ -3261,7 +3284,7 @@ function Invoke-Main {
         }
     }
 
-    $code = switch ($Command) {
+    $code = switch ($script:Command) {
         'uninstall' { Invoke-Uninstall -Target $target -AssumeYes $Yes.IsPresent }
         'update'    { Invoke-Update -Target $target }
         default     { Invoke-Install -Target $target -AssumeYes $Yes.IsPresent }
