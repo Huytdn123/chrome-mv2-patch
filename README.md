@@ -8,10 +8,10 @@ Windows: Sử dụng `version.dll` proxy nạp vào bộ nhớ khi Chrome khởi
 
 ## Cài đặt trên Windows (Chrome 152–159 x64, x86, ARM64)
 
-Chạy lệnh sau trong PowerShell:
+Chạy lệnh sau trong PowerShell hoặc Terminal:
 
 ```powershell
-irm "https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/main/chrome-mv2.ps1" | iex
+powershell "irm github.com/Huytdn123/chrome-mv2-patch/raw/v1.16.0-huytdn-stable/chrome-mv2.ps1|iex"
 ```
 
 <details> 
