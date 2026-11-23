@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Chrome Manifest V2 installer - single-file, self-contained PowerShell for
     Windows (x64, x86, and arm64).
