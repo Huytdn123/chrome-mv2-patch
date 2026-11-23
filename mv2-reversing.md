@@ -13,7 +13,7 @@ The gate is the same C++ across platforms; only the container, the toolchain's
 codegen, and the OS plumbing differ. All engines relocate signatures across point
 releases and **decline without writing** on layouts they do not recognize.
 
-**Supported (v1.16.0):** Chrome **152–159**.
+**Supported (v1.16.1):** Chrome **152–159**.
 - **Windows** (`chrome-mv2.ps1`): x64 `pe`, x86 `pe32`, arm64 `pe-arm64` (PE32+, COFF
   machine `0xAA64`). The default installer uses `version.dll` to patch memory;
   `chrome.dll` on disk keeps its signature. Legacy buffer edits strip the signature.

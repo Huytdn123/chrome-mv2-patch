@@ -1,4 +1,4 @@
-# Chrome MV2 Extension Patcher (v1.16.0)
+# Chrome MV2 Extension Patcher (v1.16.1)
 
 > **Tác giả gốc:** [Sketchystan1/chrome-mv2-patch](https://github.com/Sketchystan1/chrome-mv2-patch) (Phát hành theo [MIT License](LICENSE) - Copyright (c) 2026 Sketchy)  
 > **Bản dựng độc lập:** [Huytdn123/chrome-mv2-patch](https://github.com/Huytdn123/chrome-mv2-patch)

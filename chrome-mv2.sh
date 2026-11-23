@@ -45,7 +45,7 @@
 
 set -euo pipefail
 
-readonly APP_VERSION="1.16.0"
+readonly APP_VERSION="1.16.1"
 
 # ============================================================================
 # Internal signature-token format. signatures.json (fetched from GitHub, or a

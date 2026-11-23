@@ -133,7 +133,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.16.0'
+$AppVersion      = '1.16.1'
 $SignaturesFile  = 'signatures.json'
 $SignaturesUrl   = 'https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/v1.16.0/signatures.json'
 # Pinned version.dll release v1.16.0 on Huytdn123/chrome-mv2-patch

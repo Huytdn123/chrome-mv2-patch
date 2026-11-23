@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.16.1] - 2026-11-23
+
+- **Intelligent Signature & Fingerprint Verification**: Pre-flight PE analysis, milestone gate resolution, and comprehensive diagnostics (`Invoke-Check`).
+- **Fail-Closed Safety**: Automatic abort if gate match is incomplete or if an Authenticode hash mismatch is detected, preventing unstable browser state.
+- **Smart Cache (Schema v2)**: Instantaneous repeat checks with 64-character SHA-256 validation; enforces fresh rescan on install.
+- **Authenticode Signature Verification**: True signature status validation (`Valid`, `NotSigned`, `HashMismatch`, `NotTrusted`, `Unknown`) via `Get-AuthenticodeSignature`.
+- **PE Parser Bounds Checking**: Robust bounds validation for DOS header, `e_lfanew`, NT headers, machine type, optional headers, and section tables.
+- **Enterprise Policy Preservation**: Replaced destructive policy deletion with read-only audit (`Get-ChromePolicyStatus`, `Audit-ChromePolicies`), preserving organization registry settings.
+
 ## [1.16.0] - 2026-11-07
 
 - Chrome 159 support.
