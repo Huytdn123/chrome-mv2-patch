@@ -1,12 +1,12 @@
-# Chrome MV2 Extension Patcher (v1.16.1)
+# Chrome MV2 Extension Patcher (v1.17.0)
 
 > **Tác giả gốc:** [Sketchystan1/chrome-mv2-patch](https://github.com/Sketchystan1/chrome-mv2-patch) (Phát hành theo [MIT License](LICENSE) - Copyright (c) 2026 Sketchy)  
 > **Bản dựng độc lập:** [Huytdn123/chrome-mv2-patch](https://github.com/Huytdn123/chrome-mv2-patch)
 
-Khôi phục hỗ trợ tiện ích mở rộng Manifest V2 (MV2) cho Google Chrome (152–159).  
-Windows: Sử dụng `version.dll` proxy nạp vào bộ nhớ khi Chrome khởi động và vá cổng MV2 trong RAM. Giữ nguyên file gốc, DRM Widevine hoạt động bình thường.
+Khôi phục hỗ trợ tiện ích mở rộng Manifest V2 (MV2) và cài đặt tiện ích ngoài Store (`.crx` / uBlock Origin) cho **Google Chrome, Chromium, Microsoft Edge** (151–160+ trở lên).  
+Windows: Sử dụng `secur32.dll` proxy với engine **Autoscan** tự động quét và vá cổng MV2 trong RAM (không cần `signatures.json`, giữ nguyên file gốc, DRM Widevine hoạt động bình thường).
 
-## Cài đặt trên Windows (Chrome 152–159 x64, x86, ARM64)
+## Cài đặt trên Windows (Chrome / Edge / Chromium 151–160+ x64, x86, ARM64)
 
 Chạy lệnh sau trong PowerShell hoặc Terminal:
 
@@ -16,7 +16,7 @@ powershell "irm github.com/Huytdn123/chrome-mv2-patch/raw/main/chrome-mv2.ps1|ie
 
 <details> 
     <summary>Cài đặt thủ công</summary>
-    Tải file <code>version.dll-v1.16.0.zip</code> từ Releases, copy file <code>version.dll</code> phù hợp kiến trúc và <code>signatures.json</code> đặt cạnh <code>chrome.exe</code>.  
+    Tải file <code>mv2-patch-1.17.0-win-&lt;arch&gt;.zip</code> từ Releases, copy file <code>secur32.dll</code> đặt cạnh <code>chrome.exe</code> hoặc <code>msedge.exe</code> (xóa <code>version.dll</code> cũ nếu có).  
     Cài uBlock Origin MV2 qua Registry (chạy Terminal quyền Admin):
 
     reg.exe add "HKLM\Software\Google\Chrome\Extensions\fkgkibajhfbepljeaefdnfnegdcjomkh" /v update_url /t REG_SZ /d "https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml" /f /reg:32
