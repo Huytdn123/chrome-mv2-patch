@@ -135,7 +135,7 @@ $ErrorActionPreference = 'Stop'
 
 $AppVersion      = '1.17.0'
 $SignaturesFile  = 'signatures.json'
-$SignaturesUrl   = 'https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/dev/v1.17.0/signatures.json'
+$SignaturesUrl   = 'https://raw.githubusercontent.com/Huytdn123/chrome-mv2-patch/main/signatures.json'
 # Pinned secur32.dll release v1.17.0 on Huytdn123/chrome-mv2-patch (per-arch ZIP)
 $DllReleaseZipUrl = 'https://github.com/Huytdn123/chrome-mv2-patch/releases/download/v1.17.0/mv2-patch-1.17.0-win-{0}.zip'
 $ExpectedZipSha256 = @{
