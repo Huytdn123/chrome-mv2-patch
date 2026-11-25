@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.17.0] - 2026-11-25
+
+- **Autoscan Engine (`secur32.dll`)**: Integrated dynamic structural MV2 gate recognition for Chrome, Chromium, and Microsoft Edge (versions 151–160+, x64/x86/ARM64) without requiring `signatures.json` on Windows.
+- **Off-Store CRX & InstallVerifier Support**: Automatically unlocks off-store MV2 extensions (including uBlock Origin) and CRX installation checks in memory.
+- **DPAPI WirePlan Cache + `rundll32.exe` Self-Helper**: Sub-second startup on cached launches; zero separate CLI executable needed.
+- **Zero Renderer Crashes (`STATUS_INVALID_IMAGE_HASH`)**: Child processes only forward standard `secur32.dll` exports.
+- **One-Liner Upgrade (`chrome-mv2.ps1`)**: Preserves the `irm | iex` workflow, auto-cleans legacy `version.dll` from v1.16.x, and supports Chrome, Edge, and Chromium.
+
 ## [1.16.1] - 2026-11-23
 
 - **Intelligent Signature & Fingerprint Verification**: Pre-flight PE analysis, milestone gate resolution, and comprehensive diagnostics (`Invoke-Check`).
